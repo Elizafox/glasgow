@@ -1,6 +1,7 @@
 import os
 import traceback
 import importlib.metadata
+import json
 import packaging.requirements
 import pathlib
 import sysconfig
@@ -29,13 +30,22 @@ def _unmet_requirements_in(requirements):
     unmet_requirements = set()
     for requirement in requirements:
         try:
-            version = importlib.metadata.version(requirement.name)
+            distribution = importlib.metadata.distribution(requirement.name)
         except importlib.metadata.PackageNotFoundError:
             unmet_requirements.add(requirement)
             continue
-        if not requirement.specifier.contains(version):
+        if not requirement.specifier.contains(distribution.version):
             unmet_requirements.add(requirement)
             continue
+        if requirement.url and requirement.url.startswith("git+"):
+            # A version match cannot establish that an unreleased Git fix is installed.
+            url, _, revision = requirement.url.removeprefix("git+").rpartition("@")
+            source = json.loads(distribution.read_text("direct_url.json") or "{}")
+            vcs = source.get("vcs_info", {})
+            if (source.get("url") != url or vcs.get("vcs") != "git" or
+                    vcs.get("commit_id") != revision):
+                unmet_requirements.add(requirement)
+                continue
         if requirement.extras:
             raise NotImplementedError("Optional dependency requirements within plugin dependencies "
                                       "are not supported yet")

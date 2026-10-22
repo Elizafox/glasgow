@@ -114,6 +114,10 @@ def run_async(main: Callable[[], Awaitable[int | None]]):
     The :py:`main` function called from a new :mod:`asyncio` event loop after applying any
     necessary workarounds for platform and library quirks.
 
+    On Windows, this uses a selector event loop, as required by the optional Twisted HTTP
+    support. Applications that create their own event loop and use HTTP features must also
+    select :class:`asyncio.SelectorEventLoop` on Windows.
+
     Moreover, if the file with the :meth:`run_async` decorator is directly invoked from the command
     line (as opposed to being imported), it also calls the wrapped :py:`main` function, as if that
     file includes the following code immediately after the definition of :py:`main`:
@@ -131,7 +135,9 @@ def run_async(main: Callable[[], Awaitable[int | None]]):
         TqdmProgressImpl().register()
 
         try:
-            exit(asyncio.run(main()))
+            # Twisted's optional HTTP support requires a selector loop on Windows.
+            loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
+            exit(asyncio.run(main(), loop_factory=loop_factory))
         except KeyboardInterrupt:
             exit(130) # 128 + SIGNIT
 

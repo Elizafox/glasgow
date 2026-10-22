@@ -84,8 +84,16 @@ builtin-toolchain = [
 
 # The rest of the optional dependences belong to plugins (applets, loggers, etc.)
 http = [
-  "aiohttp>=3.13.0",
-  "aiohttp-remotes>=1.2,<2",
+  # List the TLS and WebSocket dependencies explicitly: plugin requirement checking does not
+  # support dependencies with extras.
+  # Use the WebSocket message-reassembly fix until it is available in a release.
+  # https://github.com/twisted/twisted/pull/12886
+  "Twisted @ git+https://github.com/twisted/twisted.git@c4001f59f6787b70cb2046c0b99b4195ac2b321a",
+  "pyOpenSSL>=25.3.0",
+  "service-identity>=24.1.0",
+  "wsproto>=1.2.0",
+  # Twisted's typing imports need compatibility with Python 3.15.
+  "typing-extensions>=4.15.0",
 ]
 numpy = [
   "numpy~=2.2",
@@ -223,4 +231,4 @@ repl.cmd = "python -m asyncio"
 # Lockfile with distribution wheel set. Used to build a Windows .msi installer. Wheels in this
 # lockfile are expected to cross-compile to win32/win_amd64 with MinGW (this implies that they must
 # be using setuptools). It also excludes the builtin toolchain, as a native one is cross-compiled.
-"update-pylock.dist.toml".cmd = "pdm lock -q -L pylock.dist.toml"
+"update-pylock.dist.toml".cmd = "pdm lock -q -L pylock.dist.toml --prod"

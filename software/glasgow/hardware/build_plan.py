@@ -133,7 +133,7 @@ class GlasgowBuildPlan:
             try:
                 stdout_data = await self._asyncio_subprocess_exec(args, cwd=build_dir, env=environ)
             except NotImplementedError:
-                # QtAsyncio does not implement `asyncio.subprocess.create_subprocess_exec`.
+                # QtAsyncio and Windows selector loops do not support asyncio subprocesses.
                 stdout_data = await self._fallback_subprocess_exec(args, cwd=build_dir, env=environ)
             bitstream_data = (pathlib.Path(build_dir) / self._product_name).read_bytes()
         except:

@@ -135,24 +135,20 @@
 #     Good general-purpose OPL3 test.
 
 from abc import ABCMeta, abstractmethod, abstractproperty
-import os.path
 import argparse
 import struct
 import asyncio
-import aiohttp, aiohttp.web
-import hashlib
-import gzip
-from io import BytesIO
 from amaranth import *
 from amaranth.lib import data
 from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
-from urllib.parse import urlparse
 
 from glasgow.support import logging
 from glasgow.gateware.clockgen import *
 from glasgow.protocol.vgm import *
 from glasgow.applet import *
+
+from .web import YamahaOPxWebInterface
 
 
 class YamahaCPUBus(Elaboratable):
@@ -815,247 +811,6 @@ class YamahaVGMStreamPlayer(VGMStreamPlayer):
 
     async def wait_seconds(self, delay):
         await self._opx_iface.wait_clocks(int(delay * self.clock_rate))
-
-
-class YamahaOPxWebInterface:
-    def __init__(self, logger, opx_iface, set_voltage, allow_urls):
-        self._logger    = logger
-        self._opx_iface = opx_iface
-
-        self._lock       = asyncio.Lock()
-        self._queue_len  = 0
-        self._queue_cond = asyncio.Condition()
-
-        self._set_voltage = set_voltage
-        self._allow_urls  = allow_urls
-
-    async def serve_index(self, request):
-        with open(os.path.join(os.path.dirname(__file__), "index.html")) as f:
-            index_html = f.read()
-            index_html = index_html.replace("{{chip}}", self._opx_iface.chips[-1])
-            index_html = index_html.replace("{{compat}}", ", ".join(self._opx_iface.chips))
-            index_html = index_html.replace("{{url_display}}",
-                                            "block" if self._allow_urls else "none")
-            return aiohttp.web.Response(text=index_html, content_type="text/html")
-
-    async def _update_queue_len(self, delta):
-        await self._queue_cond.acquire()
-        self._queue_len += delta
-        self._queue_cond.notify_all()
-        self._queue_cond.release()
-
-    async def serve_queue(self, request):
-        sock = aiohttp.web.WebSocketResponse()
-        await sock.prepare(request)
-
-        try:
-            while True:
-                await self._queue_cond.acquire()
-                try:
-                    await sock.send_json({"len": self._queue_len})
-                    await self._queue_cond.wait()
-                finally:
-                    self._queue_cond.release()
-
-        except aiohttp.ClientConnectionResetError:
-            pass
-
-    async def serve_vgm(self, request):
-        sock = aiohttp.web.WebSocketResponse()
-        await sock.prepare(request)
-
-        headers = await sock.receive_json()
-        vgm_msg = await sock.receive()
-
-        if vgm_msg.type == aiohttp.WSMsgType.BINARY:
-            vgm_data = vgm_msg.data
-        elif vgm_msg.type == aiohttp.WSMsgType.TEXT:
-            self._logger.info("web: URL %s submitted by %s",
-                              vgm_msg.data, request.remote)
-
-            if not self._allow_urls:
-                self._logger.warning("Received URL submission when disabled")
-                await sock.close(code=405, message="URL submissions not allowed")
-                return sock
-
-            async with aiohttp.ClientSession() as client_sess:
-                async with client_sess.get(vgm_msg.data) as client_resp:
-                    if client_resp.status != 200:
-                        await sock.close(code=2000 + client_resp.status,
-                                         message=client_resp.reason)
-                        return sock
-
-                    if "Content-Length" not in client_resp.headers:
-                        await sock.close(code=2999, message=
-                            "Remote server did not specify Content-Length")
-                        return sock
-                    elif int(client_resp.headers["Content-Length"]) > (1<<20):
-                        await sock.close(code=2999, message=
-                            f"File too large ({client_resp.headers['Content-Length']} bytes) "
-                            f"to be fetched")
-                        return sock
-
-                    vgm_data = await client_resp.read()
-        else:
-            assert vgm_msg.type == aiohttp.WSMsgType.ERROR
-            self._logger.warning("web: broken upload: %s", vgm_msg.data)
-            return sock
-
-        digest = hashlib.sha256(vgm_data).hexdigest()[:16]
-        self._logger.info("web: %s: submitted by %s",
-                          digest, request.remote)
-
-        try:
-            if len(vgm_data) < 0x80:
-                raise ValueError("File is too short to be valid")
-
-            try:
-                vgm_stream = BytesIO(vgm_data)
-                if not vgm_data.startswith(b"Vgm "):
-                    vgm_stream = gzip.GzipFile(fileobj=vgm_stream)
-
-                vgm_reader = VGMStreamReader(vgm_stream)
-            except OSError:
-                raise ValueError("File is not in VGM or VGZ format")
-
-            self._logger.info("web: %s: VGM has commands for %s",
-                              digest, ", ".join(vgm_reader.chips()))
-
-            clock_rate, clock_prescaler = self._opx_iface.get_vgm_clock_rate(vgm_reader)
-            if clock_rate == 0:
-                raise ValueError(
-                    f"VGM file contains commands for {', '.join(vgm_reader.chips())}, "
-                    f"which is not a supported chip")
-            if clock_rate & 0xc0000000:
-                raise ValueError("VGM file uses unsupported chip configuration")
-            if len(vgm_reader.chips()) != 1:
-                raise ValueError(
-                    f"VGM file contains commands for {', '.join(vgm_reader.chips())}, "
-                    f"but only playback of exactly one chip is supported")
-            clock_rate *= clock_prescaler
-
-            self._logger.info("web: %s: VGM is looped for %.2f/%.2f s",
-                              digest, vgm_reader.loop_seconds, vgm_reader.total_seconds)
-
-            vgm_player = YamahaVGMStreamPlayer(vgm_reader, self._opx_iface, clock_rate)
-        except ValueError as e:
-            self._logger.warning("web: %s: broken upload: %s",
-                                 digest, str(e))
-            await sock.close(code=1001, message=str(e))
-            return sock
-
-        sample_rate = 1 / vgm_player.sample_time
-        self._logger.info("web: %s: sample rate %d", digest, sample_rate)
-
-        await self._update_queue_len(+1)
-
-        async with self._lock:
-            try:
-                voltage = float(headers["Voltage"])
-                self._logger.info("web: %s: setting voltage to %.2f V", digest, voltage)
-                await self._set_voltage(voltage)
-
-            except Exception as error:
-                await self._update_queue_len(-1)
-
-                await sock.close(code=2000, message=str(error))
-                return sock
-
-            self._logger.info("web: %s: start streaming", digest)
-
-            await self._opx_iface.reset()
-            if self._opx_iface.filter is not None:
-                self._opx_iface.filter.sample_rate = sample_rate * self._opx_iface.sample_clocks
-            # Soft reset does not clear all the state immediately, so wait a bit to make sure
-            # all notes decay, etc.
-            await vgm_player.wait_seconds(1)
-
-            sample_queue = asyncio.Queue()
-            record_fut = asyncio.ensure_future(vgm_player.record(sample_queue))
-            play_fut   = asyncio.ensure_future(vgm_player.play())
-
-            try:
-                total_samples = int(vgm_reader.total_seconds * sample_rate)
-                if vgm_reader.loop_samples in (0, vgm_reader.total_samples):
-                    # Either 0 or the entire VGM here means we'll loop the complete track.
-                    loop_skip_to = 0
-                else:
-                    loop_skip_to = int((vgm_reader.total_seconds - vgm_reader.loop_seconds)
-                                       * sample_rate)
-                await sock.send_json({
-                    "Chip": vgm_reader.chips()[0],
-                    "Channel-Count": self._opx_iface.channel_count,
-                    "Sample-Rate": sample_rate,
-                    "Total-Samples": total_samples,
-                    "Loop-Skip-To": loop_skip_to,
-                })
-
-                while True:
-                    if play_fut.done() and play_fut.exception():
-                        break
-
-                    samples = await asyncio.wait_for(sample_queue.get(), timeout=5.0)
-                    if not samples:
-                        break
-                    await sock.send_bytes(samples)
-
-                for fut in [play_fut, record_fut]:
-                    try:
-                        await fut
-                    except NotImplementedError as e:
-                        self._logger.exception("web: %s: error streaming",
-                                               digest)
-                        await sock.close(code=2000, message=str(e))
-                        return sock
-
-                self._logger.info("web: %s: done streaming",
-                                  digest)
-                await sock.close()
-
-            except TimeoutError:
-                self._logger.info("web: %s: timeout streaming",
-                                  digest)
-                await sock.close(code=1002, message="Streaming timeout (glitched too hard?)")
-
-                for fut in [play_fut, record_fut]:
-                    if not fut.done():
-                        fut.cancel()
-
-            except asyncio.CancelledError:
-                self._logger.info("web: %s: cancel streaming",
-                                  digest)
-
-                for fut in [play_fut, record_fut]:
-                    if not fut.done():
-                        fut.cancel()
-                raise
-
-            finally:
-                await self._update_queue_len(-1)
-
-            return sock
-
-    async def serve(self, endpoint):
-        app = aiohttp.web.Application()
-        app.add_routes([
-            aiohttp.web.get("/",      self.serve_index),
-            aiohttp.web.get("/queue", self.serve_queue),
-            aiohttp.web.get("/vgm",   self.serve_vgm),
-        ])
-
-        try:
-            from aiohttp_remotes import XForwardedRelaxed, setup as setup_remotes
-            await setup_remotes(app, XForwardedRelaxed())
-        except ImportError:
-            self._logger.warning("aiohttp_remotes not installed; X-Forwarded-For will not be used")
-
-        runner = aiohttp.web.AppRunner(app,
-            access_log_format='%a(%{X-Forwarded-For}i) "%r" %s "%{Referer}i" "%{User-Agent}i"')
-        await runner.setup()
-        parsed_endpoint = urlparse(f"//{endpoint}")
-        site = aiohttp.web.TCPSite(runner, parsed_endpoint.hostname, parsed_endpoint.port)
-        await site.start()
-        await asyncio.Future()
 
 
 class AudioYamahaOPxApplet(GlasgowApplet):

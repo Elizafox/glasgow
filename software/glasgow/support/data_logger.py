@@ -3,14 +3,13 @@ import re
 import time
 import sys
 import csv
-from typing import TYPE_CHECKING
-try:
-    import yarl
-    import aiohttp
-except ImportError:
-    if not TYPE_CHECKING:
-        yarl = None
-        aiohttp = None
+from urllib.parse import urlencode, urlsplit, urlunsplit
+from importlib.util import find_spec
+
+
+def _write_url(endpoint, path, **query):
+    url = urlsplit(endpoint)
+    return urlunsplit((url.scheme, url.netloc, path, urlencode(query), ""))
 
 
 __all__ = ["DataLogger", "STDOUTDataLogger"]
@@ -34,7 +33,7 @@ class DataLogger:
     def add_subparsers(cls, parser):
         p_data_logger = parser.add_subparsers(dest="data_logger", metavar="DATA-LOGGER")
         for name, subcls in cls.all_data_loggers.items():
-            if not subcls.available:
+            if not subcls.available():
                 continue
             p_data_logger_subcls = p_data_logger.add_parser(
                 name, help=subcls.help, description=subcls.description)
@@ -156,7 +155,7 @@ class InfluxDBDataLogger(DataLogger, name="influxdb"):
 
     @classmethod
     def available(cls):
-        return aiohttp is not None
+        return find_spec("twisted") is not None
 
     @classmethod
     def add_arguments(cls, parser):
@@ -190,21 +189,18 @@ class InfluxDBDataLogger(DataLogger, name="influxdb"):
             help="submit data in groups of BATCH-SIZE points")
 
     async def setup(self, args):
-        url = yarl.URL(args.endpoint)
-        url = url.with_path("/write")
-        url = url.with_query(db=args.database)
+        query = {"db": args.database}
         if args.retention_policy:
-            url = url.update_query(rp=args.retention_policy)
+            query["rp"] = args.retention_policy
         if args.precision:
-            url = url.update_query(precision=args.precision)
-        self.url = url
+            query["precision"] = args.precision
+        self.url = _write_url(args.endpoint, "/write", **query)
         self.series = ",".join([
             self._escape_name(", ", args.measurement),
             *[self._escape_name(",= ", key) + "=" + self._escape_name(",= ", value)
               for key, value in args.tags]
         ])
         self.precision = args.precision
-        self.session = aiohttp.ClientSession()
         self._queue = []
         self._batch_size = args.batch_size
 
@@ -229,15 +225,27 @@ class InfluxDBDataLogger(DataLogger, name="influxdb"):
         self._queue.append(data)
 
         if len(self._queue) >= self._batch_size:
-            try:
-                async with self.session.post(self.url, data="\n".join(self._queue)) as response:
-                    if response.status not in range(200, 300):
-                        self.logger.error("InfluxDB: write status=%d body=%s",
-                                          response.status, (await response.text()).strip())
-                    self._queue.clear()
-            except aiohttp.ClientError as error:
-                self.logger.error("InfluxDB: http error=%s", str(error), exc_info=error)
-                # don't clear queue on network error
+            await self._submit()
+
+    async def _submit(self, headers=None):
+        from .http import HTTPContext
+        from twisted.internet.error import ConnectError, ConnectionLost
+        from twisted.web.client import ResponseFailed, RequestTransmissionFailed
+
+        headers = {"Content-Type": "text/plain; charset=utf-8", **(headers or {})}
+        try:
+            async with HTTPContext() as http:
+                response = await http.request("POST", self.url,
+                    data="\n".join(self._queue).encode(), headers=headers)
+                body = await http.read(response)
+                if response.code not in range(200, 300):
+                    self.logger.error("InfluxDB: write status=%d body=%s",
+                                      response.code, body.decode(errors="replace").strip())
+                self._queue.clear()
+        except (ConnectError, ConnectionLost, ResponseFailed, RequestTransmissionFailed,
+                TimeoutError) as error:
+            self.logger.error("InfluxDB: http error=%s", str(error), exc_info=error)
+            # Keep queued points on network errors.
 
     async def report_data(self, fields, timestamp=None):
         assert set(fields) == set(self.field_names)
@@ -259,7 +267,7 @@ class InfluxDB2DataLogger(DataLogger, name="influxdb2"):
 
     @classmethod
     def available(cls):
-        return aiohttp is not None
+        return find_spec("twisted") is not None
 
     @classmethod
     def add_arguments(cls, parser):
@@ -296,12 +304,10 @@ class InfluxDB2DataLogger(DataLogger, name="influxdb2"):
             help="set the Token to use for Authentication")
 
     async def setup(self, args):
-        url = yarl.URL(args.endpoint)
-        url = url.with_path("/api/v2/write")
-        url = url.with_query(org=args.org, bucket=args.bucket)
+        query = {"org": args.org, "bucket": args.bucket}
         if args.precision:
-            url = url.update_query(precision=args.precision)
-        self.url = url
+            query["precision"] = args.precision
+        self.url = _write_url(args.endpoint, "/api/v2/write", **query)
         self.token = args.token
         self.series = ",".join([
             InfluxDBDataLogger._escape_name(", ", args.measurement),
@@ -310,7 +316,6 @@ class InfluxDB2DataLogger(DataLogger, name="influxdb2"):
               for key, value in args.tags]
         ])
         self.precision = args.precision
-        self.session = aiohttp.ClientSession()
         self._queue = []
         self._batch_size = args.batch_size
 
@@ -335,17 +340,7 @@ class InfluxDB2DataLogger(DataLogger, name="influxdb2"):
         self._queue.append(data)
 
         if len(self._queue) >= self._batch_size:
-            try:
-                authHeader = "Token " + self.token
-                async with self.session.post(self.url, data="\n".join(self._queue),
-                        headers={"Authorization": authHeader}) as response:
-                    if response.status not in range(200, 300):
-                        self.logger.error("InfluxDB: write status=%d body=%s",
-                                          response.status, (await response.text()).strip())
-                    self._queue.clear()
-            except aiohttp.ClientError as error:
-                self.logger.error("InfluxDB: http error=%s", str(error), exc_info=error)
-                # don't clear queue on network error
+            await InfluxDBDataLogger._submit(self, headers={"Authorization": "Token " + self.token})
 
     async def report_data(self, fields, timestamp=None):
         assert set(fields) == set(self.field_names)
