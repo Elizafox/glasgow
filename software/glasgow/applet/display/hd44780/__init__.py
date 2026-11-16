@@ -26,18 +26,11 @@ __all__ = ["HD44780Component", "HD44780Interface"]
 
 # FPGA commands
 class _Command(enum.IntFlag, shape=8):
-    XFER_BIT_DATA = 0b0001
-    XFER_BIT_READ = 0b0010
-    XFER_BIT_HALF = 0b0100
-    XFER_BIT_WAIT = 0b1000
-
-
-XFER_COMMAND  = 0
-XFER_WRITE    = _Command.XFER_BIT_DATA
-XFER_POLL     = _Command.XFER_BIT_READ
-XFER_READ     = _Command.XFER_BIT_DATA | _Command.XFER_BIT_READ
-XFER_INIT     = _Command.XFER_BIT_HALF
-XFER_WAIT     = _Command.XFER_BIT_WAIT
+    COMMAND = 0b0000
+    DATA    = 0b0001
+    READ    = 0b0010
+    HALF    = 0b0100
+    WAIT    = 0b1000
 
 
 class _HD44780Command(enum.IntFlag, shape=8):
@@ -111,14 +104,14 @@ class HD44780Component(wiring.Component):
 
             with m.State("COMMAND"):
                 m.d.sync += [
-                    msb.eq((cmd & _Command.XFER_BIT_HALF) == 0),
-                    rs_buffer.o.eq((cmd & _Command.XFER_BIT_DATA) != 0),
-                    rw_buffer.o.eq((cmd & _Command.XFER_BIT_READ) != 0),
+                    msb.eq((cmd & _Command.HALF) == 0),
+                    rs_buffer.o.eq((cmd & _Command.DATA) != 0),
+                    rw_buffer.o.eq((cmd & _Command.READ) != 0),
                 ]
-                with m.If(cmd & _Command.XFER_BIT_WAIT):
+                with m.If(cmd & _Command.WAIT):
                     m.d.sync += timer.eq(cmd_wait_cyc)
                     m.next = "WAIT"
-                with m.Elif(cmd & _Command.XFER_BIT_READ):
+                with m.Elif(cmd & _Command.READ):
                     m.d.sync += timer.eq(rx_setup_cyc)
                     m.next = "READ-SETUP"
                 with m.Else():
@@ -164,7 +157,7 @@ class HD44780Component(wiring.Component):
 
             with m.State("READ"):
                 with m.If(timer == 0):
-                    with m.If(((cmd & _Command.XFER_BIT_DATA) == 0) & msb & di[3]):
+                    with m.If(((cmd & _Command.DATA) == 0) & msb & di[3]):
                         # BF=1, wait until it goes low
                         pass
                     with m.Else():
@@ -183,7 +176,7 @@ class HD44780Component(wiring.Component):
                     m.d.sync += timer.eq(timer - 1)
 
             with m.State("READ-PROCESS"):
-                with m.If(cmd & _Command.XFER_BIT_DATA):
+                with m.If(cmd & _Command.DATA):
                     m.d.comb += [
                         self.o_stream.payload.eq(rdata),
                         self.o_stream.valid.eq(1),
@@ -204,12 +197,11 @@ class HD44780Component(wiring.Component):
 
 
 class HD44780Interface:
-    _current_entry_mode = _HD44780Command.CMD_ENTRY_MODE
-    _current_display_mode = _HD44780Command.CMD_DISPLAY_ON_OFF
-    _current_function_mode = _HD44780Command.CMD_FUNCTION_SET
-
     def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
-                 rs: GlasgowPin, rw: GlasgowPin, e: GlasgowPin, d: GlasgowPin):
+                 rs: GlasgowPin, rw: GlasgowPin, e: GlasgowPin, d: list[GlasgowPin]):
+        self._current_entry_mode = _HD44780Command.CMD_ENTRY_MODE
+        self._current_display_mode = _HD44780Command.CMD_DISPLAY_ON_OFF
+        self._current_function_mode = _HD44780Command.CMD_FUNCTION_SET
         self._logger = logger
         self._level = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
@@ -223,28 +215,32 @@ class HD44780Interface:
 
     async def _init(self, command, poll):
         self._log("INIT: %02x", command)
-        await self._pipe.send(bytearray([XFER_INIT, command, XFER_POLL if poll else XFER_WAIT]))
-        await self._flush()
+        # The first function-set nibble needs at least 4.1 ms before the next one.
+        # Each gateware WAIT lasts 1.52 ms; use three while polling is unavailable.
+        wait = [_Command.READ] if poll else [_Command.WAIT] * 3
+        await self._pipe.send(bytes([_Command.HALF, command, *wait]))
+        await self._pipe.flush()
 
     async def _cmd(self, command):
         self._log("CMD: %02x", command)
-        await self._pipe.send(bytearray([XFER_COMMAND, command, XFER_POLL]))
-        await self._flush()
+        await self._pipe.send(bytearray([_Command.COMMAND, command, _Command.READ]))
+        await self._pipe.flush()
 
     async def _data(self, data: bytes):
         self._log("DATA: %s", data.hex())
         for byte in data:
-            await self._pipe.send(bytearray([XFER_WRITE, byte, XFER_POLL]))
-        await self._flush()
-
-    async def _flush(self):
+            await self._pipe.send(bytearray([_Command.DATA, byte, _Command.READ]))
         await self._pipe.flush()
 
     async def initialize(self):
         """Initialize the display.
 
-        This will set the display to 4-bit mode regardless of the mode it is currently in.
+        This sets 4-bit mode with one display line and the 5x7 font, clears the display,
+        turns the display and cursor off, and selects incrementing without display shift.
+        It can be called again to restore these settings.
         """
+        await asyncio.sleep(0.040) # wait for power-on before issuing instructions
+
         # HD44780 may be in either 4-bit or 8-bit mode and we don't know which.
         # The following sequence brings it to 4-bit mode regardless of which one it was in.
         await self._init(0x03, poll=False)  # either CMD_FUNCTION_SET|BIT_IFACE_8BIT
@@ -256,6 +252,15 @@ class HD44780Interface:
                                             # (the set bits are ignored)
         await self._init(0x03, poll=False)  # CMD_FUNCTION_SET|BIT_IFACE_8BIT
         await self._init(0x02, poll=True)   # CMD_FUNCTION_SET
+
+        self._current_function_mode = _HD44780Command.CMD_FUNCTION_SET
+        await self._cmd(self._current_function_mode)
+        self._current_display_mode = _HD44780Command.CMD_DISPLAY_ON_OFF
+        await self._cmd(self._current_display_mode)
+        await self.clear_display()
+        self._current_entry_mode = (_HD44780Command.CMD_ENTRY_MODE
+                                    | _HD44780Command.BIT_CURSOR_INC_POS)
+        await self._cmd(self._current_entry_mode)
 
     async def clear_display(self):
         """Clear the display."""
@@ -381,10 +386,10 @@ class HD44780Interface:
         self._current_function_mode |= _HD44780Command.BIT_FONT_5X10_DOTS
         await self._cmd(self._current_function_mode)
 
-    async def set_cursor_positon(self, *, position: int = 0, line_no: int = 0):
+    async def set_cursor_position(self, *, position: int = 0, line_no: int = 0):
         """Set the cursor position.
 
-        The positon is dependent on the number of lines which have been set.
+        The position is dependent on the number of lines which have been set.
 
         For one line a ``position`` greater than 80 characters wraps around
         to the start of the line.
@@ -453,7 +458,7 @@ class DisplayHD44780Applet(GlasgowAppletV2):
         with self.assembly.add_applet(self):
             self.assembly.use_voltage(args.voltage)
             self.hd44780_interface = HD44780Interface(self.logger, self.assembly,
-                                                      rs=args.rs, rw=args.rw, e=args.e, d=args.d)
+                                                 rs=args.rs, rw=args.rw, e=args.e, d=args.d)
 
     async def setup(self, args):
         await self.hd44780_interface.initialize()
@@ -469,11 +474,11 @@ class DisplayHD44780Applet(GlasgowAppletV2):
         # display available characters
         for i in range(16):
             # skip over addresses containing custom or no characters
-            if i in [0,1,8,9]:
+            if i in [0, 1, 8, 9]:
                 continue
             await self.hd44780_interface.home()
             await self.hd44780_interface.write_bytes(bytes([16 * i + j for j in range(8)]))
-            await self.hd44780_interface.set_cursor_positon(line_no=1)
+            await self.hd44780_interface.set_cursor_position(line_no=1)
             await self.hd44780_interface.write_bytes(bytes([16 * i + j + 8 for j in range(8)]))
             await asyncio.sleep(1)
 
@@ -498,7 +503,7 @@ class DisplayHD44780Applet(GlasgowAppletV2):
         await self.hd44780_interface.cursor_off()
         await self.hd44780_interface.cursor_blink_off()
         await self.hd44780_interface.clear_display()
-        await self.hd44780_interface.set_cursor_positon(position=2)
+        await self.hd44780_interface.set_cursor_position(position=2)
         for _ in range(5):
             for j in range(3):
                 await self.hd44780_interface.write_bytes(bytes([j]))
@@ -511,7 +516,7 @@ class DisplayHD44780Applet(GlasgowAppletV2):
         await self.hd44780_interface.clear_display()
         await self.hd44780_interface.home()
         await self.hd44780_interface.write_text("Hello")
-        await self.hd44780_interface.set_cursor_positon(position=2, line_no=1)
+        await self.hd44780_interface.set_cursor_position(position=2, line_no=1)
         await self.hd44780_interface.write_bytes(b"W\xefrld")
         await asyncio.sleep(1)
 
@@ -521,7 +526,7 @@ class DisplayHD44780Applet(GlasgowAppletV2):
             await asyncio.sleep(1)
             await self.hd44780_interface.home()
             await self.hd44780_interface.write_text(datetime.now().strftime("%H:%M:%S"))
-            await self.hd44780_interface.set_cursor_positon(line_no=1)
+            await self.hd44780_interface.set_cursor_position(line_no=1)
             await self.hd44780_interface.write_text(datetime.now().strftime("%y-%m-%d"))
 
     @classmethod

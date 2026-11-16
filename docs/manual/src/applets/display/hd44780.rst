@@ -1,6 +1,11 @@
 ``display-hd44780``
 ===================
 
+Connect RS, RW, E, and D4–D7 to the selected Glasgow pins, and connect display power
+and ground separately as required by the module. Select a compatible I/O voltage
+with ``-V``. Initialization automatically selects the 4-bit bus mode; no port
+power cycle is required.
+
 CLI reference
 -------------
 
